@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 import httpx
@@ -124,7 +125,7 @@ class BatchTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        # Opaque placeholder: production code must not parse/index the archive itself.
+        # A non-ZIP placeholder for tests that inject a search factory or check invalid input.
         (self.root / 'knowledge-base.zip').write_bytes(b'test-only-placeholder')
         self.output = self.root / 'submission.csv'
         self.calls = []
@@ -179,10 +180,11 @@ class BatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_query['current-a'].user_context, ('context-a',))
         self.assertEqual(by_query['current-b'].user_context, ())
 
-    async def test_missing_real_search_does_not_create_output(self):
+    async def test_invalid_archive_does_not_create_output(self):
         self.questions([('a', 'x')])
-        with self.assertRaisesRegex(BackendUnavailable, 'integration is unfinished'):
+        with self.assertRaisesRegex(UpstreamError, 'Knowledge base archive could not be indexed') as error:
             await run(data_dir=self.root, output_path=self.output, llm=NeutralLLM())
+        self.assertIsInstance(error.exception.__cause__, zipfile.BadZipFile)
         self.assertFalse(self.output.exists())
 
     async def test_missing_llm_configuration(self):
