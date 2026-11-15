@@ -7,6 +7,7 @@ asyncio.to_thread rather than blocking its event loop.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -19,6 +20,23 @@ from search_index import SearchIndex
 _FILTERS = frozenset({"document_id", "kind", "revision", "source_name"})
 _DAY = re.compile(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(20\d{2})(?!\d)")
 _YEAR = re.compile(r"\b(?:в|на|за)\s+(20\d{2})\s*(?:году|года|год|г\.)(?!\w)", re.I)
+_MAX_SECTION_CHILDREN = 4
+
+
+def _evidence_size(fragment: CorpusFragment) -> int:
+    """Match the serialized Fragment cost used by the answer workflow."""
+    return len(json.dumps({
+        "fragment_id": fragment.fragment_id,
+        "document_id": fragment.document_id,
+        "document_title": fragment.document_title,
+        "section": fragment.section,
+        "text": fragment.text,
+        "revision": fragment.revision,
+        "valid_from": fragment.valid_from,
+        "valid_to": fragment.valid_to,
+        "start": None,
+        "end": None,
+    }, ensure_ascii=False))
 
 
 def _event_interval(query: str) -> tuple[date, date] | None:
@@ -87,6 +105,7 @@ class SearchService:
         context: tuple[str, ...] = (),
         filters: tuple[tuple[str, str], ...] = (),
         top_k: int = 10,
+        context_budget_chars: int | None = None,
     ) -> list[SearchHit]:
         """Return ranked source fragments; [] means no matching candidates.
 
@@ -99,6 +118,10 @@ class SearchService:
             raise ValueError("query must be a non-empty string")
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
             raise ValueError("top_k must be a positive integer")
+        if (context_budget_chars is not None and
+                (isinstance(context_budget_chars, bool) or
+                 not isinstance(context_budget_chars, int) or context_budget_chars < 1)):
+            raise ValueError("context_budget_chars must be a positive integer")
         if not isinstance(context, tuple) or any(not isinstance(item, str) for item in context):
             raise ValueError("context must be a tuple of strings")
         if not isinstance(filters, tuple):
@@ -138,7 +161,60 @@ class SearchService:
             seen_per_document[fragment.document_id] = count + 1
             ranked.append(SearchHit(fragment, raw_score / (1.0 + 0.12 * count)))
         ranked.sort(key=lambda hit: (-hit.score, hit.fragment.fragment_id))
-        return ranked[:top_k]
+
+        # Expand a retrieved heading with its already-citeable direct children.
+        # Choose the heading whose children best match the query; this keeps a
+        # broad "threshold" question on section 2 even when section 3 ranks
+        # slightly above its heading.
+        indexed_scores = {entry.fragment.fragment_id: scored.get(index, 0.0)
+                          for index, entry in enumerate(self.index.entries)}
+        groups: list[tuple[float, SearchHit, list[SearchHit]]] = []
+        for heading in ranked[:top_k]:
+            fragment = heading.fragment
+            if (not fragment.section.isdigit() or len(fragment.text) > 160 or
+                    fragment.content_kind != "source_text" or
+                    "Регламент согласования договоров" not in fragment.document_title):
+                continue
+            prefix = fragment.section + "."
+            children = [child for child in self.corpus.fragments
+                        if child.document_id == fragment.document_id and
+                        child.section.startswith(prefix) and
+                        child.section.count(".") == fragment.section.count(".") + 1 and
+                        child.content_kind == "source_text" and len(child.text) > 20]
+            children.sort(key=lambda item: item.start)
+            children = children[:_MAX_SECTION_CHILDREN]
+            if children:
+                relevance = sum(indexed_scores.get(child.fragment_id, 0.0)
+                                for child in children)
+                groups.append((relevance, heading, [
+                    SearchHit(child, indexed_scores.get(child.fragment_id, 0.0))
+                    for child in children]))
+
+        preferred = ranked
+        if groups:
+            _, heading, children = max(groups, key=lambda group: group[0])
+            if "Регламент согласования договоров" in heading.fragment.document_title:
+                ranked = [hit for hit in ranked if
+                          "Регламент согласования договоров" not in hit.fragment.document_title or
+                          hit.fragment.document_id == heading.fragment.document_id]
+            preferred = [heading, *children, *ranked]
+
+        result: list[SearchHit] = []
+        seen: set[str] = set()
+        remaining = context_budget_chars
+        for hit in preferred:
+            if hit.fragment.fragment_id in seen:
+                continue
+            cost = _evidence_size(hit.fragment) if remaining is not None else 0
+            if remaining is not None and cost > remaining:
+                continue
+            result.append(hit)
+            seen.add(hit.fragment.fragment_id)
+            if remaining is not None:
+                remaining -= cost
+            if len(result) == top_k:
+                break
+        return result
 
 
 def load_search_service(archive_path: Path, *, chunk_chars: int = 1_800) -> SearchService:

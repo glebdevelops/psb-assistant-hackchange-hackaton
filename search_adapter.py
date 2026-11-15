@@ -21,6 +21,7 @@ def bind_search_service(service: SearchService, settings: Settings) -> SearchCom
             hits = await asyncio.to_thread(
                 service.search, request.query, context=request.user_context,
                 filters=request.filters, top_k=settings.top_k,
+                context_budget_chars=settings.max_context_chars,
             )
             results = []
             for hit in hits:
