@@ -1,5 +1,5 @@
 """Shared backend contracts; independent of the future search implementation."""
-from typing import Literal
+from typing import Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -77,10 +77,22 @@ class DraftClaim(Claim):
     quotes: dict[str, str]
 
 
+ClarificationCategory = Literal[
+    "contract", "event_date", "amount", "operation_type", "counterparty_type", "circumstances"
+]
+
+
 class Draft(StrictModel):
     status: Literal["answer", "clarification", "insufficient"]
     text: str = Field(min_length=1)
     claims: list[DraftClaim] = Field(default_factory=list)
+    clarification_category: ClarificationCategory | None = None
+
+    @field_validator("clarification_category", mode="before")
+    @classmethod
+    def safe_clarification_category(cls, value):
+        # Unknown/malformed model input must never become published text.
+        return value if isinstance(value, str) and value in get_args(ClarificationCategory) else None
 
 
 class SupportCheck(StrictModel):

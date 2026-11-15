@@ -20,6 +20,23 @@ Future source-location integration (not enabled; Fragment.start/end stay None):
 from schemas import AssistantResult, Claim, Draft, Fragment
 
 
+_CLARIFICATION_QUESTIONS = {
+    "contract": "Укажите номер или название договора, о котором идёт речь.",
+    "event_date": "Укажите дату события, о котором идёт речь.",
+    "amount": "Какова сумма сделки и в какой валюте она указана?",
+    "operation_type": "Какой тип операции вы рассматриваете?",
+    "counterparty_type": "Уточните тип контрагента, о котором идёт речь.",
+    "circumstances": "Опишите обстоятельства события, по которому задан вопрос.",
+}
+_GENERIC_CLARIFICATION = "Уточните, пожалуйста, обстоятельства и предмет вашего вопроса."
+
+
+def clarification_result(draft: Draft):
+    # Never interpolate model text, claims, IDs or other arbitrary model data.
+    return AssistantResult(status="clarification", text=_CLARIFICATION_QUESTIONS.get(
+        draft.clarification_category, _GENERIC_CLARIFICATION))
+
+
 def insufficient_result():
     return AssistantResult(status="insufficient", text=(
         "Не удалось подтвердить юридический вывод предоставленными фрагментами. "
