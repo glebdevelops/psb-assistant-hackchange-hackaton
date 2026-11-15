@@ -1,4 +1,5 @@
 """Local ASGI tests only; no external services and no changes to frontend assets."""
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,7 +54,12 @@ class StaticTests(unittest.IsolatedAsyncioTestCase):
             static.mkdir(parents=True)
             outside = root / 'private.txt'
             outside.write_text('outside static root')
-            (static / 'app.js').symlink_to(outside)
+            try:
+                (static / 'app.js').symlink_to(outside)
+            except OSError as exc:
+                if os.name == 'nt' and getattr(exc, 'winerror', None) == 1314:
+                    raise unittest.SkipTest('Windows does not grant symlink creation privileges') from exc
+                raise
             with patch('api.__file__', str(root / 'api.py')):
                 app = create_app()
                 self.assertEqual((await self.get(app, '/app.js')).status_code, 404)
