@@ -202,6 +202,133 @@ class PromptPolicyTests(unittest.IsolatedAsyncioTestCase):
                       llm.messages[0][0]["content"])
 
 
+class SelfContainedClaimTests(unittest.IsolatedAsyncioTestCase):
+    """Invented source fixtures and canned verdicts, NOT real DeepSeek/legal validation."""
+
+    def source(self, source_id, text, document_id="test-reg"):
+        return Fragment(fragment_id=source_id, document_id=document_id,
+                        document_title="ТЕСТОВЫЙ документ " + document_id, text=text)
+
+    def claim(self, text, *sources):
+        return {"text": text, "fragment_ids": [s.fragment_id for s in sources],
+                "quotes": {s.fragment_id: s.text for s in sources}}
+
+    async def run_claims(self, question, sources, claims, *, supported=True):
+        llm = FakeLLM({"status": "answer", "text": "", "claims": claims},
+                      {"supported": supported})
+        result = await Assistant(FakeEvidence(sources), llm, Settings()).answer(ChatRequest(question=question))
+        system = llm.messages[0][0]["content"]
+        for instruction in ("Каждый claim должен быть самодостаточным", "необходимые реальные fragment_ids",
+                            "Не расширяй область применения частного требования", "не приписывай условия письма"):
+            self.assertIn(instruction, system)
+        return result, llm
+
+    async def test_d_general_order_retains_conditional_thresholds(self):
+        sources = [self.source(str(i), text) for i, text in enumerate((
+            "2.1. Проект согласуют юридический отдел и главный бухгалтер.",
+            "2.2. Юридический отдел согласует за 3 рабочих дня, главный бухгалтер — за 2 рабочих дня.",
+            "2.3. При сумме свыше 1 млн рублей требуется дополнительное согласование финансового директора.",
+            "2.4. При сумме свыше 10 млн рублей требуется одобрение генерального директора до подписания.",
+        ))]
+        claims = [self.claim("В ТЕСТОВОЙ редакции предусмотрен следующий общий порядок; "
+                             "её применимость к событию 2024 года не установлена: " + s.text, s)
+                  for s in sources]
+        result, llm = await self.run_claims("ТЕСТ: порядок согласования для события 2024 года?", sources, claims)
+        self.assertEqual(result.status, "answer")
+        self.assertEqual(result.text, "\n\n".join(c["text"] for c in claims))
+        self.assertEqual(len(llm.messages), 2)
+        checked = json.loads(llm.messages[1][1]["content"])
+        self.assertEqual(checked["draft"]["claims"], claims)
+        self.assertEqual(result.claims[2].fragment_ids, [sources[2].fragment_id])
+
+    async def test_d_cancellation_alone_cannot_establish_applicability(self):
+        source = self.source("end", "ТЕСТ: редакция утратила силу 01.03.2025.")
+        claims = [self.claim("ТЕСТ: эта редакция безусловно действовала в 2024 году.", source)]
+        # Exact citation passes; semantic rejection remains authoritative.
+        from verification import validate_citations
+        self.assertTrue(validate_citations(Draft(status="answer", text="", claims=claims), [source]))
+        result, llm = await self.run_claims("ТЕСТ: редакция для 2024 года?", [source], claims, supported=False)
+        self.assertIn("только по дате её отмены", llm.messages[0][0]["content"])
+        self.assertIn("дата утверждения не равнозначна дате вступления в силу", llm.messages[0][0]["content"])
+        self.assertEqual(result.status, "insufficient")
+        self.assertEqual(result.claims, [])
+        self.assertEqual(len(llm.messages), 2)
+
+    async def test_d_date_conclusion_can_cite_multiple_fragments(self):
+        # Explicit effective date exists ONLY in this synthetic fixture.
+        start = self.source("start", "ТЕСТ: редакция вступает в силу 01.02.2023.")
+        end = self.source("end", "ТЕСТ: редакция утратила силу 01.03.2025.")
+        claims = [self.claim("ТЕСТ: указан период действия с 01.02.2023 до утраты силы 01.03.2025.", start, end)]
+        result, llm = await self.run_claims("ТЕСТ: какой период указан?", [start, end], claims)
+        self.assertEqual(result.status, "answer")
+        self.assertEqual(result.claims[0].fragment_ids, ["start", "end"])
+        self.assertEqual(result.fragments, [start, end])
+        self.assertEqual(len(llm.messages), 2)
+
+    def sanctions_fixture(self):
+        scope = self.source("scope", "ТЕСТОВОЕ письмо К-12: с 21.04.2025 иностранные контрагенты "
+                            "проходят санкционную проверку до подписания договора.", "test-letter")
+        timing = self.source("timing", "ТЕСТ: срок проверки — 3 рабочих дня с получения запроса; "
+                             "заключение размещается в СЭД.", "test-letter")
+        appendix = self.source("appendix", "ТЕСТОВОЕ приложение: проверяется страна регистрации.", "test-letter")
+        regulation = self.source("reg54", "ТЕСТОВАЯ редакция 2025, п. 5.4: для иностранного контрагента "
+                                 "проводятся юридическая проверка и валютный контроль.")
+        return scope, timing, appendix, regulation
+
+    async def test_f_scope_repeated_and_letter_separate_from_regulation(self):
+        scope, timing, appendix, regulation = self.sanctions_fixture()
+        claims = [
+            self.claim("По ТЕСТОВОМУ письму К-12 с 21.04.2025 иностранный контрагент проходит "
+                       "санкционную проверку до подписания договора.", scope),
+            self.claim("По ТЕСТОВОМУ письму К-12 с 21.04.2025 проверка иностранного контрагента "
+                       "занимает 3 рабочих дня с получения запроса; заключение размещается в СЭД.", scope, timing),
+            self.claim("По приложению к ТЕСТОВОМУ письму К-12 с 21.04.2025 при санкционной проверке "
+                       "иностранного контрагента проверяется страна регистрации.", scope, appendix),
+            self.claim("По п. 5.4 ТЕСТОВОЙ редакции 2025 для иностранного контрагента проводятся "
+                       "юридическая проверка и валютный контроль.", regulation),
+        ]
+        result, llm = await self.run_claims("ТЕСТ: требования санкционной проверки?",
+                                           [scope, timing, appendix, regulation], claims)
+        self.assertEqual(result.status, "answer")
+        self.assertEqual([c.fragment_ids for c in result.claims],
+                         [["scope"], ["scope", "timing"], ["scope", "appendix"], ["reg54"]])
+        self.assertTrue(all("иностранн" in c.text for c in result.claims))
+        self.assertEqual(len(llm.messages), 2)
+
+    async def test_f_generalization_or_mixed_documents_blocks_entire_answer(self):
+        scope, timing, _, regulation = self.sanctions_fixture()
+        good = self.claim("По ТЕСТОВОМУ письму с 21.04.2025 иностранный контрагент проходит "
+                          "санкционную проверку до подписания договора.", scope)
+        for bad in (self.claim("Проверка всех контрагентов занимает 3 рабочих дня.", scope, timing),
+                    self.claim("Пункт 5.4 устанавливает срок санкционной проверки 3 рабочих дня.", regulation)):
+            with self.subTest(bad=bad):
+                result, llm = await self.run_claims("ТЕСТ: проверка?", [scope, timing, regulation],
+                                                   [good, bad], supported=False)
+                self.assertEqual(result.status, "insufficient")
+                self.assertEqual(result.claims, [])
+                self.assertEqual(result.fragments, [])
+                self.assertEqual(len(llm.messages), 2)
+
+    async def test_a_payment_unchanged_requires_contract_and_amendment_quotes(self):
+        contract = self.source("payment", "ТЕСТОВЫЙ договор П-17/2024, п. 4.2: оплата в течение "
+                               "30 календарных дней после подписания УПД.", "test-contract")
+        amendment = self.source("amendment", "ТЕСТОВОЕ допсоглашение № 1: изменяется адрес доставки; "
+                                "остальные условия договора сохраняются.", "test-amendment")
+        claim = self.claim("По ТЕСТОВОМУ договору П-17/2024 оплата производится в течение 30 календарных "
+                           "дней после подписания УПД. ТЕСТОВОЕ допсоглашение № 1 меняет адрес доставки "
+                           "и сохраняет остальные условия, включая этот срок оплаты.", contract, amendment)
+        result, llm = await self.run_claims("ТЕСТ: срок оплаты?", [contract, amendment], [claim])
+        self.assertEqual(result.status, "answer")
+        self.assertEqual(result.claims[0].fragment_ids, ["payment", "amendment"])
+        self.assertEqual(len(llm.messages), 2)
+        # Missing required quote must fail before the semantic call.
+        claim["quotes"].pop("amendment")
+        result, llm = await self.run_claims("ТЕСТ: срок оплаты?", [contract, amendment], [claim])
+        self.assertEqual(result.status, "insufficient")
+        self.assertEqual(result.claims, [])
+        self.assertEqual(len(llm.messages), 1)
+
+
 class NonAnswerSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_switch_cannot_publish_unverified_text_or_claims(self):
         # Same unverified conclusion must not escape by changing its status.
