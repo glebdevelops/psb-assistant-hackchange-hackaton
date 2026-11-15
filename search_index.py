@@ -110,12 +110,28 @@ class SearchIndex:
     def score(self, query: str, context: tuple[str, ...] = ()) -> dict[int, float]:
         """Score current question first; prior user messages provide weak hints."""
         query_terms = tuple(dict.fromkeys(terms(query)))
-        context_terms = tuple(dict.fromkeys(terms(" ".join(context[-3:]))))[:80]
+        query_codes = {term for term in query_terms if "-" in term and
+                       any(ch.isdigit() for ch in term) and any(ch.isalpha() for ch in term)}
+        prior_terms = tuple(dict.fromkeys(terms(context[-1]))) if context else ()
+        prior_codes = {term for term in prior_terms if "-" in term and
+                       any(ch.isdigit() for ch in term) and any(ch.isalpha() for ch in term)}
+        # A new explicit contract wins. Multiple contracts in the previous user
+        # message are ambiguous, so neither its identity nor its topic is carried.
+        use_context = bool(context) and len(prior_codes) == 1 and not (
+            query_codes and query_codes != prior_codes)
+        context_terms = prior_terms[:80] if use_context else ()
         weights = {term: 0.25 for term in context_terms}
         related: set[str] = set()
-        for group in _RELATED_TERMS:
-            if any(term in group for term in query_terms):
-                related.update(group)
+        current_topics = {position for position, group in enumerate(_RELATED_TERMS)
+                          if any(term in group for term in query_terms)}
+        carried_topics = set()
+        if use_context and not current_topics:
+            prior_topics = {position for position, group in enumerate(_RELATED_TERMS)
+                            if any(term in group for term in prior_terms)}
+            if len(prior_topics) == 1:
+                carried_topics = prior_topics
+        for position in current_topics | carried_topics:
+            related.update(_RELATED_TERMS[position])
         weights.update({term: 0.4 for term in related})
         weights.update({term: 1.0 for term in query_terms})
         scores: dict[int, float] = defaultdict(float)
@@ -127,19 +143,17 @@ class SearchIndex:
         # Titles and exact identifiers are important in this corpus: several
         # contracts have near-identical counterparties but different numbers.
         identifiers = [term for term in query_terms if any(ch.isdigit() for ch in term)]
-        contract_codes = {term for term in identifiers
-                          if "-" in term and any(ch.isalpha() for ch in term)}
-        context_codes = {term for term in terms(context[-1])
-                         if "-" in term and any(ch.isdigit() for ch in term)
-                         and any(ch.isalpha() for ch in term)} if context else set()
-        anchored_by_context = not contract_codes and bool(context_codes)
+        contract_codes = query_codes.copy()
+        anchored_by_context = not contract_codes and use_context
         if anchored_by_context:
-            contract_codes = context_codes
+            contract_codes = prior_codes
         law_codes = set(query_terms) & {"нк", "тк", "коап"}
         article_numbers = {term for term in identifiers if term.isdigit() and len(term) <= 3}
         asks_payment_deadline = (
-            normalize_token("срок") in query_terms and
-            any(term in _RELATED_TERMS[0] for term in query_terms)
+            (normalize_token("срок") in query_terms or
+             any(word in query.casefold().replace("ё", "е") for word in
+                 ("отсчет", "начинает", "начинается", "течет"))) and
+            0 in (current_topics | carried_topics)
         )
         for index, entry in enumerate(self.entries):
             title_matches = sum(weights[term] for term in entry.title_terms if term in query_terms)

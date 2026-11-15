@@ -103,6 +103,29 @@ class RealIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all([item.fragment_id for item in batch] ==
                             [item.fragment_id for item in hits] for batch in parallel))
 
+    async def test_regulation_expansion_and_followup_at_backend_boundary(self):
+        settings = Settings(top_k=10, max_context_chars=4_000)
+        components = await initialize_search(self.archive, settings)
+        for year, revision in ((2024, "2023"), (2026, "2025")):
+            with self.subTest(year=year):
+                hits = await components.evidence(SearchQuery(
+                    f"Какой порог согласования договора действовал в {year} году?"))
+                regulation = [item for item in hits if
+                              "Регламент согласования договоров" in item.document_title]
+                self.assertTrue({"2.1", "2.2", "2.3", "2.4"}.issubset(
+                    {item.section for item in regulation}))
+                self.assertEqual({item.revision for item in regulation}, {revision})
+                self.assertLessEqual(sum(len(json.dumps(item.model_dump(), ensure_ascii=False))
+                                         for item in hits), settings.max_context_chars)
+                self.assertEqual(len({item.fragment_id for item in hits}), len(hits))
+                for item in regulation:
+                    source = await components.documents(item.document_id)
+                    self.assertIn(item.text, source.text)
+        followup = await components.evidence(SearchQuery(
+            "А с какого момента начинает течь этот срок?",
+            user_context=("Какой срок оплаты по договору П-17/2024 с Альфа-Трейд?",)))
+        self.assertEqual(followup[0].section, "4.2")
+
     async def test_api_startup_once_and_source_route(self):
         llm = CitationLLM()
         with patch("api.initialize_search", wraps=initialize_search) as loader:
