@@ -188,6 +188,53 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BackendUnavailable):
             await OpenAICompatibleClient(Settings()).complete([])
 
+    async def test_deepseek_thinking_only_for_official_api(self):
+        real_client = httpx.AsyncClient
+        for base_url, expected in (
+            ("https://api.deepseek.com", True),
+            ("https://api.deepseek.com/v1", True),
+            ("https://other.invalid/v1", False),
+            ("https://api.deepseek.com.other.invalid", False),
+            ("http://api.deepseek.com", False),
+        ):
+            calls = []
+
+            def handler(request):
+                calls.append(request)
+                return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+            settings = Settings(llm_base_url=base_url, llm_api_key="test-only", llm_model="deepseek-flash",
+                                retry_attempts=1)
+            with self.subTest(base_url=base_url), patch("llm_client.httpx.AsyncClient",
+                    side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+                self.assertEqual(await OpenAICompatibleClient(settings).complete([]), "ok")
+                self.assertEqual(len(calls), 1)
+                body = json.loads(calls[0].content)
+                self.assertEqual(body.get("thinking"), {"type": "disabled"} if expected else None)
+
+    async def test_deepseek_error_handling_with_single_attempt(self):
+        real_client = httpx.AsyncClient
+        settings = Settings(llm_base_url="https://api.deepseek.com", llm_api_key="test-only",
+                            llm_model="deepseek-flash", retry_attempts=1, max_tokens=64)
+        for response, error_type in (
+            (httpx.Response(200, json={"choices": [{"message": {"content": None,
+                                                          "reasoning_content": "synthetic"},
+                                                   "finish_reason": "length"}]}), UpstreamError),
+            (httpx.Response(429, json={"error": "synthetic"}), UpstreamError),
+            (httpx.Response(403, json={"error": "synthetic"}), BackendUnavailable),
+        ):
+            calls = []
+
+            def handler(request):
+                calls.append(request)
+                return response
+
+            with self.subTest(status=response.status_code), patch("llm_client.httpx.AsyncClient",
+                    side_effect=lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)):
+                with self.assertRaises(error_type):
+                    await OpenAICompatibleClient(settings).complete([])
+                self.assertEqual(len(calls), 1)
+
     async def test_wire_contract_and_errors(self):
         settings = Settings(llm_base_url="https://synthetic.invalid/v1", llm_api_key="test-only", llm_model="test-model")
         real_client = httpx.AsyncClient

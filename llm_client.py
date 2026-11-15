@@ -1,5 +1,7 @@
 """Official OpenAI-compatible wire protocol, without SDK URL rewriting."""
 import asyncio
+from urllib.parse import urlsplit
+
 import httpx
 from config import Settings
 from dependencies import BackendUnavailable, UpstreamError, UpstreamTimeout
@@ -17,11 +19,16 @@ class OpenAICompatibleClient:
         async with self._slots:
             for attempt in range(settings.retry_attempts):
                 try:
+                    endpoint = urlsplit(url)
+                    payload = {"model": settings.llm_model, "messages": messages,
+                               "temperature": settings.temperature, "max_tokens": settings.max_tokens}
+                    if (endpoint.scheme == "https" and endpoint.hostname == "api.deepseek.com"
+                            and endpoint.port in (None, 443)):
+                        payload["thinking"] = {"type": "disabled"}
                     async with httpx.AsyncClient(timeout=settings.llm_timeout) as client:
                         response = await client.post(url, headers={
                             "Authorization": "Bearer " + settings.llm_api_key,
-                        }, json={"model": settings.llm_model, "messages": messages,
-                                 "temperature": settings.temperature, "max_tokens": settings.max_tokens})
+                        }, json=payload)
                         if response.status_code in (401, 403):
                             raise BackendUnavailable("LLM authorization failed (401/403); contact organizers")
                         response.raise_for_status()
