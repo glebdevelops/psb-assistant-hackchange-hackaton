@@ -1,14 +1,13 @@
-"""Backend-owned injection boundaries, not the participant #1 module API.
+"""Backend-owned injection boundaries for search, documents and LLM.
 
-A future bridge translates these calls to the actual search/document interfaces.
-No implementation or fake knowledge base is installed in production.
+The search_adapter bridge translates these calls to search_service.SearchService.
 
 Integration requirements:
 - SearchFactory(archive_path: Path, settings: Settings) initializes once and
   returns SearchComponents(evidence, documents). solution.run already does this;
   API bootstrap must do so once before create_app, never once per question.
-- Assistant prepares SearchQuery before calling EvidenceProvider. The future
-  bridge translates this payload to participant #1's confirmed API; it never
+- Assistant prepares SearchQuery before calling EvidenceProvider. The adapter
+  translates this payload to the search service API; it never
   receives ChatRequest or assistant dialogue.
 - Query fields: current query, bounded prior USER context, confirmed filters.
   No automatic date/document filters are inferred yet. Context is not evidence.
@@ -17,11 +16,8 @@ Integration requirements:
 - Documents returns Document for a stable exact revision ID, None for unknown ID.
 - Raise BackendUnavailable for absent setup, UpstreamError for service/data
   failures, UpstreamTimeout for deadlines. Do not turn failures into [] or None.
-- Providers share a reusable index, not user/session mutable state. Protect
-  mutable internals with locks or serialize non-thread-safe engines in the
-  bridge; blocking work must not block the async event loop. MAX_WORKERS limits
-  batch concurrency but does not make an engine safe by itself.
-- These are our adapter requirements, not claims about existing participant code.
+- Providers share one read-only index. The adapter runs synchronous search in
+  a worker thread, so it does not block the async event loop.
 """
 from __future__ import annotations
 
@@ -53,7 +49,7 @@ class UpstreamTimeout(Exception):
     """Upstream deadline exceeded."""
 
 
-# Backend integration contract; does not prescribe participant #1's module API.
+# Backend integration contract; the search module has its own public API.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -74,8 +70,9 @@ class SearchFactory(Protocol):
 
 
 async def initialize_search(archive_path: Path, settings: "Settings") -> SearchComponents:
-    """Replace only this bridge once the real module contract is confirmed."""
-    raise BackendUnavailable("Search integration is unfinished: connect participant #1's module")
+    """Build one reusable corpus/index and return the backend providers."""
+    from search_adapter import create_search_components
+    return await create_search_components(archive_path, settings)
 
 
 @dataclass(frozen=True)
