@@ -329,6 +329,121 @@ class SelfContainedClaimTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(llm.messages), 1)
 
 
+class NarrowClaimAndQuoteTests(unittest.IsolatedAsyncioTestCase):
+    """Synthetic documents and canned verdicts do not predict real LLM behavior."""
+
+    async def answer(self, sources, claims, *, supported=True):
+        llm = FakeLLM({"status": "answer", "text": "", "claims": claims}, {"supported": supported})
+        result = await Assistant(FakeEvidence(sources), llm, Settings()).answer(ChatRequest(question="ТЕСТ"))
+        return result, llm
+
+    def source(self, fid, text):
+        return Fragment(fragment_id=fid, document_id="test-" + fid,
+                        document_title="ТЕСТОВЫЙ документ " + fid, text=text)
+
+    def claim(self, text, *sources):
+        return {"text": text, "fragment_ids": [s.fragment_id for s in sources],
+                "quotes": {s.fragment_id: s.text for s in sources}}
+
+    async def test_d_separate_date_facts_and_qualified_rule(self):
+        approved = self.source("approval", "ТЕСТ: редакция утверждена 10.01.2023.")
+        repealed = self.source("repeal", "ТЕСТ: редакция утратила силу 01.03.2025.")
+        rule = self.source("rule", "ТЕСТ: при сумме свыше 1 млн рублей требуется согласование финансового директора.")
+        claims = [self.claim(approved.text, approved), self.claim(repealed.text, repealed),
+                  self.claim("В ТЕСТОВОЙ редакции при сумме свыше 1 млн рублей требуется согласование "
+                             "финансового директора; применимость редакции к событию 2024 года не установлена.", rule)]
+        result, llm = await self.answer([approved, repealed, rule], claims)
+        self.assertEqual(result.status, "answer")
+        self.assertEqual([c.fragment_ids for c in result.claims], [["approval"], ["repeal"], ["rule"]])
+        self.assertEqual(result.text, "\n\n".join(c["text"] for c in claims))
+        self.assertEqual(len(llm.messages), 2)
+        prompt = llm.messages[0][0]["content"]
+        for instruction in ("один самостоятельный юридический вывод на claim",
+                            "Подтверждай утверждение о каждой дате собственной цитатой",
+                            "не должно отделять условие от правила",
+                            "не объявляя её применимой к событию"):
+            self.assertIn(instruction, prompt)
+
+    async def test_d_unsupported_composite_intro_still_rejects_whole_answer(self):
+        source = self.source("repeal", "ТЕСТ: редакция утратила силу 01.03.2025.")
+        claims = [self.claim(source.text, source),
+                  self.claim("ТЕСТ: редакция утверждена в 2023 году и применима ко всем событиям 2024 года.", source)]
+        result, llm = await self.answer([source], claims, supported=False)
+        self.assertEqual(result.status, "insufficient")
+        self.assertEqual(result.claims, [])
+        self.assertEqual(result.fragments, [])
+        self.assertEqual(len(llm.messages), 2)
+
+    async def test_g_unicode_spaces_survive_payload_and_exact_quote(self):
+        for space in ("\u00a0", "\u202f"):
+            with self.subTest(space=repr(space)):
+                quote = f"налоговая{space}ставка{space}составляет 20 процентов"
+                source = self.source("vat", "10. ТЕСТ: " + quote + ".")
+                claim = self.claim("ТЕСТ: в приведённом пункте указана ставка 20 процентов.", source)
+                claim["quotes"]["vat"] = quote
+                result, llm = await self.answer([source], [claim])
+                self.assertEqual(result.status, "answer")
+                self.assertEqual(len(llm.messages), 2)
+                generated = json.loads(llm.messages[0][1]["content"])
+                checked = json.loads(llm.messages[1][1]["content"])
+                self.assertEqual(generated["evidence"][0]["text"], source.text)
+                self.assertEqual(checked["draft"]["claims"][0]["quotes"]["vat"], quote)
+                self.assertEqual(result.fragments[0].text, source.text)
+                self.assertIn("не нормализуй Unicode", llm.messages[0][0]["content"])
+
+    async def test_g_replacing_unicode_spaces_is_rejected_before_support(self):
+        from verification import validate_citations
+        for space in ("\u00a0", "\u202f"):
+            with self.subTest(space=repr(space)):
+                source = self.source("vat", f"ТЕСТ: налоговая{space}ставка составляет 20 процентов.")
+                claim = self.claim("ТЕСТ: ставка 20 процентов.", source)
+                claim["quotes"]["vat"] = source.text.replace(space, " ")
+                self.assertFalse(validate_citations(Draft(status="answer", text="", claims=[claim]), [source]))
+                result, llm = await self.answer([source], [claim])
+                self.assertEqual(result.status, "insufficient")
+                self.assertEqual(result.fragments, [])
+                self.assertEqual(len(llm.messages), 1)
+
+    async def test_g_short_relevant_quote_does_not_require_unrelated_paragraph(self):
+        source = self.source("vat", "1. ТЕСТ: для операции X налоговая ставка составляет 20 процентов.\n"
+                             "10. ТЕСТ: служебное\u00a0примечание об иной операции.")
+        claim = self.claim("ТЕСТ: для операции X указана ставка 20 процентов.", source)
+        claim["quotes"]["vat"] = "для операции X налоговая ставка составляет 20 процентов."
+        result, llm = await self.answer([source], [claim])
+        self.assertEqual(result.status, "answer")
+        self.assertEqual(len(llm.messages), 2)
+        self.assertNotIn("примечание", claim["quotes"]["vat"])
+        self.assertIn("не сокращай цитату ценой потери условия", llm.messages[0][0]["content"])
+
+    async def test_a_address_quote_alone_does_not_establish_unchanged_payment(self):
+        payment = self.source("payment", "ТЕСТ: оплата за 30 календарных дней после подписания УПД.")
+        amendment = self.source("amendment", "ТЕСТ: изменён адрес доставки. Остальные условия сохраняются.")
+        claim = self.claim("ТЕСТ: после изменения адреса срок оплаты остаётся 30 календарных дней "
+                           "после подписания УПД.", payment, amendment)
+        claim["quotes"]["amendment"] = "изменён адрес доставки."
+        # Structural validity does not prove completeness; keep semantic rejection.
+        result, llm = await self.answer([payment, amendment], [claim], supported=False)
+        self.assertEqual(result.status, "insufficient")
+        self.assertEqual(len(llm.messages), 2)
+        self.assertIn("так и оговорку о сохранении остальных условий", llm.messages[0][0]["content"])
+
+    async def test_f_scope_and_event_retained_in_each_claim(self):
+        scope = self.source("scope", "ТЕСТ: письмо применяется к иностранным контрагентам с 21.04.2025.")
+        sources = [self.source(fid, text) for fid, text in (
+            ("time", "ТЕСТ: проверка занимает 3 рабочих дня с получения запроса."),
+            ("checklist", "ТЕСТ: проверяется страна регистрации."),
+            ("signing", "ТЕСТ: до подписания договора требуется завершить проверку."),
+        )]
+        claims = [self.claim("По ТЕСТОВОМУ письму с 21.04.2025 для иностранного контрагента: " + s.text,
+                             scope, s) for s in sources]
+        result, llm = await self.answer([scope] + sources, claims)
+        self.assertEqual(result.status, "answer")
+        self.assertTrue(all("иностранного контрагента" in c.text and "21.04.2025" in c.text for c in result.claims))
+        self.assertEqual([c.fragment_ids for c in result.claims], [["scope", s.fragment_id] for s in sources])
+        self.assertEqual(len(llm.messages), 2)
+        self.assertIn("перечне проверок и запрете подписания", llm.messages[0][0]["content"])
+
+
 class NonAnswerSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_switch_cannot_publish_unverified_text_or_claims(self):
         # Same unverified conclusion must not escape by changing its status.
