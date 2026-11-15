@@ -84,7 +84,8 @@ ClarificationCategory = Literal[
 
 class Draft(StrictModel):
     status: Literal["answer", "clarification", "insufficient"]
-    text: str = Field(min_length=1)
+    # Required internal field, never published; empty/whitespace strings are valid.
+    text: str = Field(strict=True)
     claims: list[DraftClaim] = Field(default_factory=list)
     clarification_category: ClarificationCategory | None = None
 
