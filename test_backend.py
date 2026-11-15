@@ -8,7 +8,7 @@ from assistant import Assistant
 from config import Settings
 from dependencies import BackendUnavailable, UpstreamError, UpstreamTimeout, SearchQuery, prepare_search_query
 from llm_client import OpenAICompatibleClient
-from schemas import AssistantResult, ChatRequest, Fragment
+from schemas import AssistantResult, ChatRequest, Draft, Fragment
 
 
 SOURCE = Fragment(fragment_id="test-f1", document_id="test-doc", document_title="ТЕСТОВЫЙ документ",
@@ -277,6 +277,101 @@ class NonAnswerSafetyTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result.status, "insufficient")
                     self.assertEqual(result.claims, [])
                     self.assertEqual(result.fragments, [])
+
+
+class EmptyDraftTextTests(unittest.IsolatedAsyncioTestCase):
+    async def chat(self, value, *, supported=True):
+        from api import create_app
+        llm = FakeLLM(value, {"supported": supported})
+        app = create_app(evidence=FakeEvidence(), llm=llm)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/api/chat", json={"question": "ТЕСТОВЫЙ вопрос"})
+        return response, llm
+
+    async def test_blank_clarifications_use_backend_questions(self):
+        cases = (
+            ("", "contract", "Укажите номер или название договора, о котором идёт речь."),
+            ("   ", "amount", "Какова сумма сделки и в какой валюте она указана?"),
+            ("", "unknown", "Уточните, пожалуйста, обстоятельства и предмет вашего вопроса."),
+            ("", "event_date", "Укажите дату события, о котором идёт речь."),
+        )
+        for text, category, expected in cases:
+            with self.subTest(text=text, category=category):
+                response, llm = await self.chat({"status": "clarification", "text": text,
+                                                 "clarification_category": category})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {"status": "clarification", "text": expected,
+                                                   "claims": [], "fragments": []})
+                self.assertEqual(len(llm.messages), 1)
+
+    async def test_blank_insufficient_uses_backend_message(self):
+        from verification import insufficient_result
+        for text in ("", "   "):
+            with self.subTest(text=text):
+                response, llm = await self.chat({"status": "insufficient", "text": text,
+                                                 "claims": draft("invented")["claims"]})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), insufficient_result().model_dump())
+                self.assertEqual(len(llm.messages), 1)
+
+    async def test_blank_answer_requires_citations_and_support(self):
+        from verification import validate_citations
+        for text in ("", "   "):
+            with self.subTest(text=text):
+                value = {**draft(), "text": text}
+                with patch("assistant.validate_citations", wraps=validate_citations) as citations:
+                    response, llm = await self.chat(value)
+                citations.assert_called_once()
+                self.assertEqual(response.status_code, 200)
+                data = response.json()
+                self.assertEqual(data["status"], "answer")
+                self.assertEqual(data["text"], value["claims"][0]["text"])
+                self.assertEqual(data["claims"][0]["fragment_ids"], [SOURCE.fragment_id])
+                self.assertEqual(len(llm.messages), 2)
+                checked = json.loads(llm.messages[1][1]["content"])
+                self.assertEqual(checked["draft"]["claims"], value["claims"])
+
+    async def test_blank_answer_without_evidence_or_support_is_rejected(self):
+        from verification import insufficient_result
+        cases = (
+            ({"status": "answer", "text": ""}, True, 1),
+            ({"status": "answer", "text": "", "claims": []}, True, 1),
+            ({**draft(quote="Выдуманная цитата"), "text": ""}, True, 1),
+            ({**draft("invented"), "text": ""}, True, 1),
+            ({**draft(), "text": ""}, False, 2),
+        )
+        for value, supported, calls in cases:
+            with self.subTest(value=value, supported=supported):
+                response, llm = await self.chat(value, supported=supported)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), insufficient_result().model_dump())
+                self.assertEqual(len(llm.messages), calls)
+
+    async def test_missing_null_and_wrong_text_types_remain_format_errors(self):
+        for status in ("answer", "clarification", "insufficient"):
+            for field in ({}, *({"text": t} for t in (None, 123, 1.5, True, [], {}))):
+                with self.subTest(status=status, field=field):
+                    value = {**draft(), "status": status, **field}
+                    if not field:
+                        value.pop("text")
+                    with self.assertRaises(ValidationError):
+                        Draft.model_validate(value)
+                    response, llm = await self.chat(value)
+                    self.assertEqual(response.status_code, 502)
+                    self.assertEqual(len(llm.messages), 1)
+
+    async def test_nonanswer_arbitrary_text_and_fake_sources_are_never_published(self):
+        unsafe = "ТЕСТ: любое обязательство прекращается через 999 дней."
+        for status in ("clarification", "insufficient"):
+            with self.subTest(status=status):
+                response, llm = await self.chat({**draft("invented"), "status": status,
+                                                 "text": unsafe, "clarification_category": "contract"})
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn(unsafe, response.text)
+                self.assertNotIn("invented", response.text)
+                self.assertEqual(response.json()["claims"], [])
+                self.assertEqual(response.json()["fragments"], [])
+                self.assertEqual(len(llm.messages), 1)
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):
