@@ -17,7 +17,7 @@
       <div class="sidebar-bottom">Ответы формируются по предоставленным документам. Если сведений не хватает, ассистент попросит уточнение или объяснит ограничение.</div>
     </aside>
     <main class="main">
-      <header class="topbar"><div><h1 class="topbar-title">Юридический ассистент</h1><p class="topbar-sub">Вопросы по внутренним документам и нормативным актам</p></div><div class="status" id="status" data-state="idle" role="status"><span class="status-dot" aria-hidden="true"></span><span id="statusText">Ожидает вопрос</span></div></header>
+      <header class="topbar"><div><h1 class="topbar-title">Юридический ассистент</h1><p class="topbar-sub">Вопросы по внутренним документам и нормативным актам</p></div><button class="mobile-new-chat" id="mobileNewChat" type="button" aria-label="Новый диалог" title="Новый диалог">＋</button><div class="status" id="status" data-state="idle" role="status"><span class="status-dot" aria-hidden="true"></span><span id="statusText">Ожидает вопрос</span></div></header>
       <section class="conversation" id="conversation" aria-label="Диалог"><div class="conversation-inner" id="messages" aria-live="polite"></div></section>
       <div class="composer-wrap"><div class="composer-inner"><form class="composer" id="chatForm"><textarea id="question" rows="1" maxlength="10000" aria-label="Ваш вопрос" placeholder="Спросите о договоре, регламенте или норме закона…" required></textarea><button class="send" id="send" type="submit" aria-label="Отправить вопрос" disabled>↑</button></form><p class="composer-help">Enter — отправить, Shift+Enter — новая строка. Укажите дату события и номер документа, если они известны.</p></div></div>
     </main>

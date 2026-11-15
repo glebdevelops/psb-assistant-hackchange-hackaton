@@ -25,6 +25,7 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #85adff; outli
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 72px; padding: 0 34px; border-bottom: 1px solid #e2e8f2; background: #fff; }
 .topbar-title { margin: 0; font-size: 16px; font-weight: 750; }
 .topbar-sub { margin: 3px 0 0; color: #687995; font-size: 12px; }
+.mobile-new-chat { display: none; }
 .status { display: flex; align-items: center; gap: 8px; color: #556681; font-size: 12px; white-space: nowrap; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #a7b2c2; }
 .status[data-state="ready"] .status-dot { background: #25a774; }
@@ -94,6 +95,7 @@ mark { padding: 2px 0; border-radius: 3px; background: #ffe7a0; color: inherit; 
   .prompts { grid-template-columns: 1fr; }
   .prompt { min-height: 72px; }
   .composer-wrap { padding: 10px 14px 15px; }
-  .status span:last-child { display: none; }
+  .status { display: none; }
+  .mobile-new-chat { flex: 0 0 38px; display: grid; place-items: center; width: 38px; height: 38px; border: 1px solid #cbdcf2; border-radius: 10px; background: #fff; color: #1b5cae; font-size: 23px; }
   .viewer-head, .viewer-body { padding: 18px; }
 }
