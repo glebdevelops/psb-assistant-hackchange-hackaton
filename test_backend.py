@@ -111,6 +111,89 @@ class AssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(llm.messages[0][1]["content"])["evidence"], [])
 
 
+class PromptPolicyTests(unittest.IsolatedAsyncioTestCase):
+    """Synthetic LLM outputs verify the prompt contract and answer workflow."""
+
+    async def test_confirmed_general_order_with_unknown_amount(self):
+        general = Fragment(
+            fragment_id="general", document_id="reg-2023",
+            document_title="ТЕСТОВЫЙ регламент, редакция 2023", section="2.1",
+            text="2.1. Проект договора согласует юридический отдел.", revision="2023")
+        threshold = Fragment(
+            fragment_id="threshold", document_id="reg-2023",
+            document_title="ТЕСТОВЫЙ регламент, редакция 2023", section="2.3",
+            text="2.3. При сумме свыше 100 рублей требуется согласование комиссии.",
+            revision="2023")
+        llm = FakeLLM({
+            "status": "answer", "text": "Неиспользуемый текст",
+            "claims": [
+                {"text": "По тестовому регламенту проект договора согласует юридический отдел (п. 2.1).",
+                 "fragment_ids": ["general"],
+                 "quotes": {"general": "Проект договора согласует юридический отдел."}},
+                {"text": "При сумме свыше 100 рублей требуется согласование комиссии (п. 2.3).",
+                 "fragment_ids": ["threshold"],
+                 "quotes": {"threshold": "При сумме свыше 100 рублей требуется согласование комиссии."}},
+            ],
+        }, {"supported": True})
+        result = await Assistant(FakeEvidence([general, threshold]), llm, Settings()).answer(
+            ChatRequest(question="Каков общий порядок согласования договора в 2024 году?"))
+        self.assertEqual(result.status, "answer")
+        self.assertEqual([claim.fragment_ids for claim in result.claims],
+                         [["general"], ["threshold"]])
+        self.assertEqual([item.fragment_id for item in result.fragments],
+                         ["general", "threshold"])
+        system = llm.messages[0][0]["content"]
+        self.assertIn("сначала изложи подтверждённую часть", system)
+        self.assertIn("Пороговые требования и", system)
+        self.assertIn("не утверждая, что они выполнены", system)
+        self.assertIn("подтверждай собственной", system)
+
+    async def test_missing_essential_event_date_requires_clarification(self):
+        timing = Fragment(
+            fragment_id="timing", document_id="test-contract",
+            document_title="ТЕСТОВЫЙ договор", section="4.2",
+            text="4.2. Оплата в течение 30 дней после получения товара.")
+        llm = FakeLLM({"status": "clarification",
+                       "text": "Когда был получен товар?", "claims": []})
+        result = await Assistant(FakeEvidence([timing]), llm, Settings()).answer(
+            ChatRequest(question="Какого числа истекает срок оплаты?"))
+        self.assertEqual(result.status, "clarification")
+        self.assertEqual(result.claims, [])
+        self.assertEqual(len(llm.messages), 1)
+        self.assertIn("нельзя дать даже частичный", llm.messages[0][0]["content"])
+
+    async def test_unresolved_conflicting_documents_remain_insufficient(self):
+        first = Fragment(fragment_id="first", document_id="one",
+                         document_title="ТЕСТОВОЕ положение 1", section="1",
+                         text="Для этой операции требуется согласование.")
+        second = Fragment(fragment_id="second", document_id="two",
+                          document_title="ТЕСТОВОЕ положение 2", section="1",
+                          text="Для этой операции согласование не требуется.")
+        llm = FakeLLM({"status": "insufficient",
+                       "text": "Документы противоречат друг другу.", "claims": []})
+        result = await Assistant(FakeEvidence([first, second]), llm, Settings()).answer(
+            ChatRequest(question="Требуется ли согласование для этой операции?"))
+        self.assertEqual(result.status, "insufficient")
+        self.assertEqual(result.fragments, [])
+        self.assertIn("При неразрешимом противоречии", llm.messages[0][0]["content"])
+
+    async def test_specific_approval_requires_unknown_amount(self):
+        threshold = Fragment(
+            fragment_id="threshold", document_id="reg-2023",
+            document_title="ТЕСТОВЫЙ регламент, редакция 2023", section="2.3",
+            text="2.3. При сумме свыше 100 рублей требуется согласование комиссии.",
+            revision="2023")
+        llm = FakeLLM({"status": "clarification",
+                       "text": "Какова сумма вашего договора?", "claims": []})
+        result = await Assistant(FakeEvidence([threshold]), llm, Settings()).answer(
+            ChatRequest(question="Требуется ли согласование комиссии именно для моего договора?"))
+        self.assertEqual(result.status, "clarification")
+        self.assertEqual(result.claims, [])
+        self.assertIn("Не придумывай сумму", llm.messages[0][0]["content"])
+        self.assertIn("общий порядок не заменяет такое решение",
+                      llm.messages[0][0]["content"])
+
+
 class APITests(unittest.IsolatedAsyncioTestCase):
     async def call(self, app, method, path, **kwargs):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
