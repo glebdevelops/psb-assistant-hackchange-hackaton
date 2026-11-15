@@ -94,8 +94,12 @@ class AssistantTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(llm.messages), 1)
 
     async def test_semantic_rejection(self):
-        result = await Assistant(FakeEvidence(), FakeLLM(draft(), {"supported": False}), Settings()).answer(ChatRequest(question="x"))
+        llm = FakeLLM(draft(), {"supported": False})
+        result = await Assistant(FakeEvidence(), llm, Settings()).answer(ChatRequest(question="x"))
         self.assertEqual(result.status, "insufficient")
+        self.assertEqual(len(llm.messages), 2)
+        self.assertEqual(result.claims, [])
+        self.assertEqual(result.fragments, [])
 
     async def test_malformed_output(self):
         with self.assertRaises(UpstreamError):
@@ -154,12 +158,14 @@ class PromptPolicyTests(unittest.IsolatedAsyncioTestCase):
             document_title="ТЕСТОВЫЙ договор", section="4.2",
             text="4.2. Оплата в течение 30 дней после получения товара.")
         llm = FakeLLM({"status": "clarification",
-                       "text": "Когда был получен товар?", "claims": []})
+                       "text": "Когда был получен товар?", "claims": [],
+                       "clarification_category": "event_date"})
         result = await Assistant(FakeEvidence([timing]), llm, Settings()).answer(
             ChatRequest(question="Какого числа истекает срок оплаты?"))
         self.assertEqual(result.status, "clarification")
         self.assertEqual(result.claims, [])
         self.assertEqual(len(llm.messages), 1)
+        self.assertEqual(result.text, "Укажите дату события, о котором идёт речь.")
         self.assertIn("нельзя дать даже частичный", llm.messages[0][0]["content"])
 
     async def test_unresolved_conflicting_documents_remain_insufficient(self):
@@ -184,14 +190,93 @@ class PromptPolicyTests(unittest.IsolatedAsyncioTestCase):
             text="2.3. При сумме свыше 100 рублей требуется согласование комиссии.",
             revision="2023")
         llm = FakeLLM({"status": "clarification",
-                       "text": "Какова сумма вашего договора?", "claims": []})
+                       "text": "Какова сумма вашего договора?", "claims": [],
+                       "clarification_category": "amount"})
         result = await Assistant(FakeEvidence([threshold]), llm, Settings()).answer(
             ChatRequest(question="Требуется ли согласование комиссии именно для моего договора?"))
         self.assertEqual(result.status, "clarification")
         self.assertEqual(result.claims, [])
+        self.assertEqual(result.text, "Какова сумма сделки и в какой валюте она указана?")
         self.assertIn("Не придумывай сумму", llm.messages[0][0]["content"])
         self.assertIn("общий порядок не заменяет такое решение",
                       llm.messages[0][0]["content"])
+
+
+class NonAnswerSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_status_switch_cannot_publish_unverified_text_or_claims(self):
+        # Same unverified conclusion must not escape by changing its status.
+        unsafe = "ТЕСТ: по выдуманному документу все сделки требуют оплаты за 999 дней."
+        for status in ("clarification", "insufficient"):
+            for claims in ([], draft("invented", "invented")["claims"]):
+                for fragments in ([], [SOURCE]):
+                    with self.subTest(status=status, claims=bool(claims), evidence=bool(fragments)):
+                        value = {"status": status, "text": unsafe, "claims": claims,
+                                 "clarification_category": "amount"}
+                        llm = FakeLLM(value)
+                        result = await Assistant(FakeEvidence(fragments), llm, Settings()).answer(
+                            ChatRequest(question="Тест"))
+                        self.assertNotIn(unsafe, result.text)
+                        self.assertNotIn("invented", result.model_dump_json())
+                        self.assertEqual(result.claims, [])
+                        self.assertEqual(result.fragments, [])
+                        self.assertEqual(len(llm.messages), 1)
+                        if status == "insufficient":
+                            from verification import insufficient_result
+                            self.assertEqual(result, insufficient_result())
+                        else:
+                            self.assertEqual(result.text, "Какова сумма сделки и в какой валюте она указана?")
+
+    async def test_controlled_categories_and_unknown_contract(self):
+        questions = {
+            "contract": "Укажите номер или название договора, о котором идёт речь.",
+            "event_date": "Укажите дату события, о котором идёт речь.",
+            "amount": "Какова сумма сделки и в какой валюте она указана?",
+            "operation_type": "Какой тип операции вы рассматриваете?",
+            "counterparty_type": "Уточните тип контрагента, о котором идёт речь.",
+            "circumstances": "Опишите обстоятельства события, по которому задан вопрос.",
+        }
+        for category, expected in questions.items():
+            with self.subTest(category=category):
+                llm = FakeLLM({"status": "clarification", "text": "Не публиковать",
+                               "clarification_category": category})
+                result = await Assistant(FakeEvidence([]), llm, Settings()).answer(
+                    ChatRequest(question="Какой срок оплаты по неизвестному договору?"))
+                self.assertEqual(result.status, "clarification")
+                self.assertEqual(result.text, expected)
+                self.assertEqual(len(llm.messages), 1)
+                self.assertEqual(set(result.model_dump()), {"status", "text", "claims", "fragments"})
+
+    async def test_unknown_malformed_and_legacy_categories_use_safe_fallback(self):
+        for value in ({}, {"clarification_category": None},
+                      {"clarification_category": "invented rule"},
+                      {"clarification_category": ["amount"]},
+                      {"clarification_category": {"amount": "invented rule"}},
+                      {"clarification_category": 123}):
+            with self.subTest(value=value):
+                llm = FakeLLM({"status": "clarification", "text": "НЕБЕЗОПАСНЫЙ ТЕКСТ", **value})
+                result = await Assistant(FakeEvidence([]), llm, Settings()).answer(ChatRequest(question="Тест"))
+                self.assertEqual(result.status, "clarification")
+                self.assertEqual(result.text, "Уточните, пожалуйста, обстоятельства и предмет вашего вопроса.")
+                self.assertEqual(len(llm.messages), 1)
+
+    async def test_answer_still_requires_citations_then_support_check(self):
+        for valid_quote, supported in ((False, True), (True, False), (True, True)):
+            with self.subTest(valid_quote=valid_quote, supported=supported):
+                value = draft() if valid_quote else draft(quote="Нет такой цитаты")
+                value["clarification_category"] = "amount"
+                llm = FakeLLM(value, {"supported": supported})
+                result = await Assistant(FakeEvidence(), llm, Settings()).answer(ChatRequest(question="Тест"))
+                self.assertEqual(len(llm.messages), 2 if valid_quote else 1)
+                if valid_quote and supported:
+                    self.assertEqual(result.status, "answer")
+                    self.assertEqual(result.text, value["claims"][0]["text"])
+                    self.assertEqual(result.fragments, [SOURCE])
+                    check_payload = json.loads(llm.messages[1][1]["content"])
+                    self.assertEqual(check_payload["draft"]["claims"], value["claims"])
+                else:
+                    self.assertEqual(result.status, "insufficient")
+                    self.assertEqual(result.claims, [])
+                    self.assertEqual(result.fragments, [])
 
 
 class APITests(unittest.IsolatedAsyncioTestCase):

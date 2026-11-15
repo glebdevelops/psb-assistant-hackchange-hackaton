@@ -6,7 +6,7 @@ from config import Settings
 from dependencies import EvidenceProvider, LanguageModel, UpstreamError, prepare_search_query
 from prompts import answer_messages, verification_messages
 from schemas import ChatRequest, Draft, SupportCheck
-from verification import finalize_answer, insufficient_result, validate_citations
+from verification import clarification_result, finalize_answer, insufficient_result, validate_citations
 
 
 class Assistant:
@@ -34,9 +34,10 @@ class Assistant:
                 draft = Draft.model_validate_json(await self.llm.complete(answer_messages(request, selected)))
             except ValidationError as exc:
                 raise UpstreamError("Invalid LLM answer format") from exc
-            if draft.status != "answer":
-                from schemas import AssistantResult
-                return AssistantResult(status=draft.status, text=draft.text)
+            if draft.status == "clarification":
+                return clarification_result(draft)
+            if draft.status == "insufficient":
+                return insufficient_result()
             if not validate_citations(draft, selected):
                 return insufficient_result()
             try:
