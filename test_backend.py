@@ -444,6 +444,92 @@ class NarrowClaimAndQuoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("перечне проверок и запрете подписания", llm.messages[0][0]["content"])
 
 
+class ConciseSupportedAnswerTests(unittest.IsolatedAsyncioTestCase):
+    """Generic synthetic examples; FakeLLM cannot validate real generation quality."""
+
+    def source(self, fid, text):
+        return Fragment(fragment_id=fid, document_id="test-" + fid,
+                        document_title="ТЕСТОВЫЙ документ " + fid, text=text)
+
+    def claim(self, text, source, quote):
+        return {"text": text, "fragment_ids": [source.fragment_id], "quotes": {source.fragment_id: quote}}
+
+    async def run_case(self, question, sources, claims, *, supported=True):
+        llm = FakeLLM({"status": "answer", "text": "Непубликуемое введение", "claims": claims},
+                      {"supported": supported})
+        result = await Assistant(FakeEvidence(sources), llm, Settings()).answer(ChatRequest(question=question))
+        system = llm.messages[0][0]["content"]
+        for instruction in ("минимальным достаточным набором claims", "Не добавляй незапрошенные сроки",
+                            "не дроби его на части", "Не выдавай частичный ответ за полный"):
+            self.assertIn(instruction, system)
+        return result, llm
+
+    async def test_focused_answer_does_not_publish_neighboring_payment_term(self):
+        for amount in (240, 730):
+            with self.subTest(amount=amount):
+                source = self.source("price", f"ТЕСТ: цена комплекта {amount} единиц. Оплата производится через 17 дней.")
+                quote = f"цена комплекта {amount} единиц."
+                text = f"В ТЕСТОВОМ документе цена комплекта составляет {amount} единиц."
+                result, llm = await self.run_case("Какова цена комплекта?", [source], [self.claim(text, source, quote)])
+                self.assertEqual(result.status, "answer")
+                self.assertEqual(result.text, text)
+                self.assertEqual(len(result.claims), 1)
+                self.assertNotIn("17", result.text)
+                self.assertNotIn("введение", result.text)
+                self.assertEqual(len(llm.messages), 2)
+                checked = json.loads(llm.messages[1][1]["content"])
+                self.assertEqual(checked["draft"]["claims"][0]["quotes"], {"price": quote})
+
+    async def test_minimal_initiator_answer_keeps_short_exact_quote(self):
+        source = self.source("workflow", "ТЕСТ: запрос\u00a0подаёт владелец процесса. Проверка занимает 8 дней.")
+        quote = "запрос\u00a0подаёт владелец процесса."
+        claim = self.claim("По ТЕСТОВОМУ порядку запрос подаёт владелец процесса.", source, quote)
+        result, llm = await self.run_case("Кто подаёт запрос?", [source], [claim])
+        self.assertEqual(result.text, claim["text"])
+        self.assertEqual(len(result.claims), 1)
+        self.assertEqual(len(llm.messages), 2)
+        self.assertEqual(json.loads(llm.messages[1][1]["content"])["draft"]["claims"][0]["quotes"]["workflow"], quote)
+
+    async def test_edition_scoped_conditional_answer_does_not_mix_rules(self):
+        old = self.source("old", "ТЕСТОВАЯ редакция X: для операций типа Q свыше 400 единиц требуется одобрение.")
+        new = self.source("new", "ТЕСТОВАЯ редакция Y: для операций типа Q свыше 900 единиц требуется одобрение.")
+        claim = self.claim("В ТЕСТОВОЙ редакции X для операций типа Q свыше 400 единиц требуется одобрение; "
+                           "её применимость к событию не установлена.", old, old.text)
+        result, llm = await self.run_case("Что предусматривает редакция X?", [old, new], [claim])
+        self.assertEqual(result.status, "answer")
+        self.assertEqual(result.text, claim["text"])
+        self.assertEqual(result.fragments, [old])
+        self.assertNotIn("900", result.text)
+        self.assertEqual(len(llm.messages), 2)
+
+    async def test_partial_answer_preserves_known_rule_without_inventing_duration(self):
+        source = self.source("service", "ТЕСТ: длительность обслуживания определяет изготовитель; "
+                             "значение указывается в сервисной карточке.")
+        claim = self.claim("По ТЕСТОВОМУ условию длительность обслуживания определяет изготовитель и указывает "
+                           "в сервисной карточке; точное значение по переданному фрагменту не установлено.",
+                           source, source.text)
+        for supported in (True, False):
+            with self.subTest(supported=supported):
+                result, llm = await self.run_case("Сколько длится обслуживание?", [source], [claim], supported=supported)
+                self.assertEqual(len(llm.messages), 2)
+                if supported:
+                    self.assertEqual(result.status, "answer")
+                    self.assertEqual(result.text, claim["text"])
+                    self.assertEqual(result.fragments, [source])
+                else:
+                    self.assertEqual(result.status, "insufficient")
+                    self.assertEqual(result.claims, [])
+                    self.assertEqual(result.fragments, [])
+
+    async def test_no_evidence_keeps_safe_insufficient(self):
+        from verification import insufficient_result
+        llm = FakeLLM({"status": "insufficient", "text": "Непроверенное объяснение"})
+        result = await Assistant(FakeEvidence([]), llm, Settings()).answer(ChatRequest(question="Каков срок?"))
+        self.assertEqual(result, insufficient_result())
+        self.assertEqual(len(llm.messages), 1)
+        self.assertIn("Если подтверждённой существенной информации нет", llm.messages[0][0]["content"])
+
+
 class NonAnswerSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_switch_cannot_publish_unverified_text_or_claims(self):
         # Same unverified conclusion must not escape by changing its status.
