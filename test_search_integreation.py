@@ -18,6 +18,7 @@ from dependencies import (BackendUnavailable, SearchQuery, UpstreamError,
                           initialize_search)
 from search_adapter import create_search_components
 from test_search import make_zip, real_archive
+from verification import insufficient_result
 
 
 class CitationLLM:
@@ -46,8 +47,10 @@ class CitationLLM:
 
 
 class NeutralLLM:
+    text = "Недостаточно сведений"
+
     async def complete(self, messages):
-        return json.dumps({"status": "insufficient", "text": "Недостаточно сведений"},
+        return json.dumps({"status": "insufficient", "text": self.text},
                           ensure_ascii=False)
 
 
@@ -168,7 +171,9 @@ class RealIntegrationTests(unittest.IsolatedAsyncioTestCase):
                                settings=Settings(), llm=NeutralLLM())
         self.assertEqual(loader.call_count, 1)
         self.assertEqual([case_id for case_id, _ in captured], ["a", "b"])
-        self.assertTrue(all(answer == "Недостаточно сведений" for _, answer in captured))
+        expected = solution.format_submission_answer(insufficient_result())
+        self.assertTrue(all(answer == expected for _, answer in captured))
+        self.assertTrue(all(NeutralLLM.text not in answer for _, answer in captured))
 
 
 if __name__ == "__main__":

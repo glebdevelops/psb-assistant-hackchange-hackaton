@@ -308,10 +308,12 @@
   question.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); el("chatForm").requestSubmit(); }
   });
-  el("newChat").addEventListener("click", () => {
+  function startNewChat() {
     activeRequest?.abort(); activeRequest = null; pending = false; history = [];
     question.value = ""; resizeQuestion(); closeViewer(); resetWelcome(); setStatus("idle", "Ожидает вопрос"); question.focus();
-  });
+  }
+  el("newChat").addEventListener("click", startNewChat);
+  el("mobileNewChat").addEventListener("click", startNewChat);
   el("closeViewer").addEventListener("click", closeViewer);
   viewerBackdrop.addEventListener("click", closeViewer);
   document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !viewer.hidden) closeViewer(); });
